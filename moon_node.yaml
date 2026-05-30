@@ -1,5 +1,4 @@
 substitutions:
-  # Public-safe placeholder values.
   # Replace these locally before flashing so calculations match your location.
   observer_latitude: "0.0000"       # Example format: "40.7128"
   observer_longitude: "0.0000"      # Example format: "-74.0060"
