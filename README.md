@@ -138,4 +138,4 @@ Possible future improvements include:
 
 ## License
 
-No license has been selected yet.
+MIT
