@@ -31,6 +31,26 @@ The project is meant to calculate and display real Moon data such as phase, illu
 * WiFi signal and diagnostic entities
 * Home Assistant integration through ESPHome
 
+* ## Before Flashing
+
+This YAML is a public template.
+
+Before flashing it to your own ESP32, you must add your own network configuration and location values.
+
+The public version does not include WiFi credentials, private location coordinates, or personal light/output functions.
+
+You need to add your own:
+
+- WiFi or Ethernet configuration
+- Latitude
+- Longitude
+- Elevation in meters
+- API encryption key if desired
+- OTA settings if desired
+- Any light, LED, display, or button functions for your own hardware
+
+The included Moon calculations are the core of the project. Hardware-specific features should be customized for each build.
+
 ## Hardware
 
 This project is currently built around an ESP32 running ESPHome.
