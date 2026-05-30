@@ -1,0 +1,1116 @@
+substitutions:
+  # Public-safe placeholder values.
+  # Replace these locally before flashing so calculations match your location.
+  observer_latitude: "0.0000"       # Example format: "40.7128"
+  observer_longitude: "0.0000"      # Example format: "-74.0060"
+  observer_elevation_m: "0.0"       # Elevation above sea level in meters.
+
+esphome:
+  name: "moon-node"
+  friendly_name: Moon Node
+  # 2026.4.0 is the floor: sram1_as_iram was added in that release.
+  min_version: 2026.4.0
+  name_add_mac_suffix: false
+
+esp32:
+  board: esp32dev
+  variant: esp32
+  framework:
+    type: esp-idf
+    advanced:
+      # WARNING: These advanced ESP-IDF options are hardware-specific.
+      #
+      # These settings were confirmed safe on the Moon Node used for this project.
+      # Do not assume they are safe for every ESP32 board.
+      #
+      # minimum_chip_revision: "3.1"
+      #   Firmware with this setting will not boot on ESP32 chips older than rev 3.1.
+      #   If your ESP32 is older, lower this value or remove the advanced block.
+      #
+      # sram1_as_iram: true
+      #   This requires a bootloader that supports using SRAM1 as IRAM.
+      #   If your bootloader does not support it, recovery may require a USB reflash.
+      #
+      # If you are copying this project to a different ESP32 and are not sure,
+      # remove the entire advanced block and use the normal ESPHome defaults.
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true
+    sdkconfig_options:
+      CONFIG_ESP_MAIN_TASK_STACK_SIZE: "16384"
+
+logger:
+  level: WARN
+
+api:
+  encryption:
+    key: "PUT_YOUR_ESPHOME_API_ENCRYPTION_KEY_HERE"
+  # 0s keeps the node computing the Moon locally while HA is unreachable.
+  # Trade-off: no self-heal reboot if the network stack wedges.
+  # Set to 15min instead if you prefer auto recovery over offline persistence.
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: "PUT_YOUR_OTA_PASSWORD_HERE"
+
+# Safe mode is auto-enabled by the OTA component. Declared explicitly so the
+# recovery button below has a component to attach to.
+safe_mode:
+
+
+# Network configuration is intentionally omitted for the public template.
+# Add your own wifi: or ethernet: section before flashing.
+
+# Time sources require a network connection. If you use this template, add your
+# own network section above before flashing so SNTP and Home Assistant time can work.
+time:
+  - platform: sntp
+    id: moon_time
+    servers:
+      - pool.ntp.org
+      - time.cloudflare.com
+    on_time_sync:
+      then:
+        - script.execute: update_moon_entities
+    on_time:
+      - seconds: 0
+        minutes: /15
+        then:
+          - script.execute: update_moon_entities
+
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      then:
+        - script.execute: update_moon_entities
+
+# Clock-independent 15-minute refresh. Keeps the moon position smoother for
+# the physical moon display, even if SNTP never validates (HA-only connectivity).
+# The SNTP on_time block above still gives wall-clock alignment every 15 minutes
+# when SNTP is available.
+interval:
+  - interval: 15min
+    then:
+      - script.execute: update_moon_entities
+
+script:
+  - id: update_moon_entities
+    mode: restart
+    then:
+      - lambda: |-
+          // Pick best available time source
+          auto now_sntp = id(moon_time).now();
+          auto now_ha   = id(ha_time).now();
+          ESPTime now;
+          if (now_sntp.is_valid())      now = now_sntp;
+          else if (now_ha.is_valid())   now = now_ha;
+          else                          return;
+
+          const double JD_UNIX_EPOCH = 2440587.5;
+          const double PI_D = 3.14159265358979323846;
+          const double DEG  = PI_D / 180.0;
+          const double AU_KM = 149597870.7;
+
+          double jd_now_ut = JD_UNIX_EPOCH + (double)now.timestamp / 86400.0;
+          double year_dec  = (jd_now_ut - 2451545.0) / 365.25 + 2000.0;
+
+          // ΔT seconds, NASA polynomial valid 2005-2050
+          double y_ = year_dec - 2000.0;
+          double delta_t = 62.92 + 0.32217 * y_ + 0.005589 * y_ * y_;
+          double dt_days = delta_t / 86400.0;
+
+          // ==========================================================
+          // Meeus Ch. 49 phase events
+          // ==========================================================
+          auto phase_jde_tt = [&](double k_frac) -> double {
+            double T  = k_frac / 1236.85;
+            double T2 = T*T, T3 = T2*T, T4 = T3*T;
+
+            double JDE = 2451550.09766 + 29.530588861 * k_frac
+                         + 0.00015437 * T2
+                         - 0.000000150 * T3
+                         + 0.00000000073 * T4;
+
+            double E  = 1.0 - 0.002516 * T - 0.0000074 * T2;
+            double E2 = E * E;
+
+            double M  =   2.5534 +  29.10535670 * k_frac
+                        - 0.0000014  * T2 - 0.00000011 * T3;
+            double Mp = 201.5643 + 385.81693528 * k_frac
+                        + 0.0107582  * T2 + 0.00001238 * T3
+                        - 0.000000058 * T4;
+            double F  = 160.7108 + 390.67050284 * k_frac
+                        - 0.0016118  * T2 - 0.00000227 * T3
+                        + 0.000000011 * T4;
+            double Om = 124.7746 -   1.56375588 * k_frac
+                        + 0.0020672  * T2 + 0.00000215 * T3;
+
+            M *= DEG; Mp *= DEG; F *= DEG; Om *= DEG;
+
+            double k_round = floor(k_frac + 0.5);
+            double frac = k_frac - k_round;
+            double corr = 0.0;
+
+            // New moon and full moon use separate Meeus Ch. 49 correction series.
+            // First and last quarter use the quarter series plus/minus W.
+            if (fabs(frac) < 0.05) {
+              corr =  -0.40720 * sin(Mp)
+                    + 0.17241*E  * sin(M)
+                    + 0.01608    * sin(2*Mp)
+                    + 0.01039    * sin(2*F)
+                    + 0.00739*E  * sin(Mp - M)
+                    - 0.00514*E  * sin(Mp + M)
+                    + 0.00208*E2 * sin(2*M)
+                    - 0.00111    * sin(Mp - 2*F)
+                    - 0.00057    * sin(Mp + 2*F)
+                    + 0.00056*E  * sin(2*Mp + M)
+                    - 0.00042    * sin(3*Mp)
+                    + 0.00042*E  * sin(M + 2*F)
+                    + 0.00038*E  * sin(M - 2*F)
+                    - 0.00024*E  * sin(2*Mp - M)
+                    - 0.00017    * sin(Om)
+                    - 0.00007    * sin(Mp + 2*M)
+                    + 0.00004    * sin(2*Mp - 2*F)
+                    + 0.00004    * sin(3*M)
+                    + 0.00003    * sin(Mp + M - 2*F)
+                    + 0.00003    * sin(2*Mp + 2*F)
+                    - 0.00003    * sin(Mp + M + 2*F)
+                    + 0.00003    * sin(Mp - M + 2*F)
+                    - 0.00002    * sin(Mp - M - 2*F)
+                    - 0.00002    * sin(3*Mp + M)
+                    + 0.00002    * sin(4*Mp);
+            } else if (fabs(fabs(frac) - 0.5) < 0.05) {
+              corr =  -0.40614 * sin(Mp)
+                    + 0.17302*E  * sin(M)
+                    + 0.01614    * sin(2*Mp)
+                    + 0.01043    * sin(2*F)
+                    + 0.00734*E  * sin(Mp - M)
+                    - 0.00515*E  * sin(Mp + M)
+                    + 0.00209*E2 * sin(2*M)
+                    - 0.00111    * sin(Mp - 2*F)
+                    - 0.00057    * sin(Mp + 2*F)
+                    + 0.00056*E  * sin(2*Mp + M)
+                    - 0.00042    * sin(3*Mp)
+                    + 0.00042*E  * sin(M + 2*F)
+                    + 0.00038*E  * sin(M - 2*F)
+                    - 0.00024*E  * sin(2*Mp - M)
+                    - 0.00017    * sin(Om)
+                    - 0.00007    * sin(Mp + 2*M)
+                    + 0.00004    * sin(2*Mp - 2*F)
+                    + 0.00004    * sin(3*M)
+                    + 0.00003    * sin(Mp + M - 2*F)
+                    + 0.00003    * sin(2*Mp + 2*F)
+                    - 0.00003    * sin(Mp + M + 2*F)
+                    + 0.00003    * sin(Mp - M + 2*F)
+                    - 0.00002    * sin(Mp - M - 2*F)
+                    - 0.00002    * sin(3*Mp + M)
+                    + 0.00002    * sin(4*Mp);
+            } else {
+              corr =  -0.62801    * sin(Mp)
+                    + 0.17172*E  * sin(M)
+                    - 0.01183*E  * sin(Mp + M)
+                    + 0.00862    * sin(2*Mp)
+                    + 0.00804    * sin(2*F)
+                    + 0.00454*E  * sin(Mp - M)
+                    + 0.00204*E2 * sin(2*M)
+                    - 0.00180    * sin(Mp - 2*F)
+                    - 0.00070    * sin(Mp + 2*F)
+                    - 0.00040    * sin(3*Mp)
+                    - 0.00034*E  * sin(2*Mp - M)
+                    + 0.00032*E  * sin(M + 2*F)
+                    + 0.00032*E  * sin(M - 2*F)
+                    - 0.00028*E2 * sin(Mp + 2*M)
+                    + 0.00027*E  * sin(2*Mp + M)
+                    - 0.00017    * sin(Om)
+                    - 0.00005    * sin(Mp - M - 2*F)
+                    + 0.00004    * sin(2*Mp + 2*F)
+                    - 0.00004    * sin(Mp + M + 2*F)
+                    + 0.00004    * sin(Mp - 2*M)
+                    + 0.00003    * sin(Mp + M - 2*F)
+                    + 0.00003    * sin(3*M)
+                    + 0.00002    * sin(2*Mp - 2*F)
+                    + 0.00002    * sin(Mp - M + 2*F)
+                    - 0.00002    * sin(3*Mp + M);
+
+              double W = 0.00306
+                       - 0.00038*E * cos(M)
+                       + 0.00026   * cos(Mp)
+                       - 0.00002   * cos(Mp - M)
+                       + 0.00002   * cos(Mp + M)
+                       + 0.00002   * cos(2*F);
+              if (frac > 0) corr += W; else corr -= W;
+            }
+
+            double A1  = (299.77 +  0.107408 * k_frac - 0.009173 * T2) * DEG;
+            double A2  = (251.88 +  0.016321 * k_frac) * DEG;
+            double A3  = (251.83 + 26.651886 * k_frac) * DEG;
+            double A4  = (349.42 + 36.412478 * k_frac) * DEG;
+            double A5  = ( 84.66 + 18.206239 * k_frac) * DEG;
+            double A6  = (141.74 + 53.303771 * k_frac) * DEG;
+            double A7  = (207.14 +  2.453732 * k_frac) * DEG;
+            double A8  = (154.84 +  7.306860 * k_frac) * DEG;
+            double A9  = ( 34.52 + 27.261239 * k_frac) * DEG;
+            double A10 = (207.19 +  0.121824 * k_frac) * DEG;
+            double A11 = (291.34 +  1.844379 * k_frac) * DEG;
+            double A12 = (161.72 + 24.198154 * k_frac) * DEG;
+            double A13 = (239.56 + 25.513099 * k_frac) * DEG;
+            double A14 = (331.55 +  3.592518 * k_frac) * DEG;
+
+            double plan =  0.000325 * sin(A1)
+                         + 0.000165 * sin(A2)
+                         + 0.000164 * sin(A3)
+                         + 0.000126 * sin(A4)
+                         + 0.000110 * sin(A5)
+                         + 0.000062 * sin(A6)
+                         + 0.000060 * sin(A7)
+                         + 0.000056 * sin(A8)
+                         + 0.000047 * sin(A9)
+                         + 0.000042 * sin(A10)
+                         + 0.000040 * sin(A11)
+                         + 0.000037 * sin(A12)
+                         + 0.000035 * sin(A13)
+                         + 0.000023 * sin(A14);
+
+            return JDE + corr + plan;
+          };
+
+          double k_now = (year_dec - 2000.0) * 12.3685;
+          double k0 = floor(k_now);
+
+          double evt_jd_ut[24];
+          double evt_k[24];
+          int    evt_type[24];
+          double offs[4] = {0.0, 0.25, 0.5, 0.75};
+
+          for (int li = 0; li < 6; li++) {
+            double kbase = k0 + (double)(li - 2);
+            for (int i = 0; i < 4; i++) {
+              double kf = kbase + offs[i];
+              int idx = li*4 + i;
+              evt_jd_ut[idx] = phase_jde_tt(kf) - dt_days;
+              evt_k[idx]     = kf;
+              evt_type[idx]  = i;
+            }
+          }
+
+          double last_new = 0, next_new = 0;
+          double last_full = 0, next_full = 0;
+          double next_q1 = 0, next_q3 = 0;
+          double next_full_k = 0;
+
+          bool have_last_new = false, have_next_new = false;
+          bool have_last_full = false, have_next_full = false;
+          bool have_next_q1 = false, have_next_q3 = false;
+
+          for (int i = 0; i < 24; i++) {
+            double t = evt_jd_ut[i];
+            int tp = evt_type[i];
+
+            if (tp == 0) {
+              if (t <= jd_now_ut && (!have_last_new || t > last_new)) {
+                last_new = t;
+                have_last_new = true;
+              }
+              if (t > jd_now_ut && (!have_next_new || t < next_new)) {
+                next_new = t;
+                have_next_new = true;
+              }
+            } else if (tp == 1) {
+              if (t > jd_now_ut && (!have_next_q1 || t < next_q1)) {
+                next_q1 = t;
+                have_next_q1 = true;
+              }
+            } else if (tp == 2) {
+              if (t <= jd_now_ut && (!have_last_full || t > last_full)) {
+                last_full = t;
+                have_last_full = true;
+              }
+              if (t > jd_now_ut && (!have_next_full || t < next_full)) {
+                next_full = t;
+                have_next_full = true;
+                next_full_k = evt_k[i];
+              }
+            } else {
+              if (t > jd_now_ut && (!have_next_q3 || t < next_q3)) {
+                next_q3 = t;
+                have_next_q3 = true;
+              }
+            }
+          }
+
+          if (!have_last_new || !have_next_new || !have_last_full || !have_next_full || !have_next_q1 || !have_next_q3) return;
+
+          // ==========================================================
+          // Meeus Ch. 47 Moon position
+          // ==========================================================
+          struct LRTerm { int8_t D, M, Mp, F; int32_t l, r; };
+          static const LRTerm tblA[60] = {
+            { 0, 0, 1, 0,  6288774, -20905355},
+            { 2, 0,-1, 0,  1274027,  -3699111},
+            { 2, 0, 0, 0,   658314,  -2955968},
+            { 0, 0, 2, 0,   213618,   -569925},
+            { 0, 1, 0, 0,  -185116,     48888},
+            { 0, 0, 0, 2,  -114332,     -3149},
+            { 2, 0,-2, 0,    58793,    246158},
+            { 2,-1,-1, 0,    57066,   -152138},
+            { 2, 0, 1, 0,    53322,   -170733},
+            { 2,-1, 0, 0,    45758,   -204586},
+            { 0, 1,-1, 0,   -40923,   -129620},
+            { 1, 0, 0, 0,   -34720,    108743},
+            { 0, 1, 1, 0,   -30383,    104755},
+            { 2, 0, 0,-2,    15327,     10321},
+            { 0, 0, 1, 2,   -12528,         0},
+            { 0, 0, 1,-2,    10980,     79661},
+            { 4, 0,-1, 0,    10675,    -34782},
+            { 0, 0, 3, 0,    10034,    -23210},
+            { 4, 0,-2, 0,     8548,    -21636},
+            { 2, 1,-1, 0,    -7888,     24208},
+            { 2, 1, 0, 0,    -6766,     30824},
+            { 1, 0,-1, 0,    -5163,     -8379},
+            { 1, 1, 0, 0,     4987,    -16675},
+            { 2,-1, 1, 0,     4036,    -12831},
+            { 2, 0, 2, 0,     3994,    -10445},
+            { 4, 0, 0, 0,     3861,    -11650},
+            { 2, 0,-3, 0,     3665,     14403},
+            { 0, 1,-2, 0,    -2689,     -7003},
+            { 2, 0,-1, 2,    -2602,         0},
+            { 2,-1,-2, 0,     2390,     10056},
+            { 1, 0, 1, 0,    -2348,      6322},
+            { 2,-2, 0, 0,     2236,     -9884},
+            { 0, 1, 2, 0,    -2120,      5751},
+            { 0, 2, 0, 0,    -2069,         0},
+            { 2,-2,-1, 0,     2048,     -4950},
+            { 2, 0, 1,-2,    -1773,      4130},
+            { 2, 0, 0, 2,    -1595,         0},
+            { 4,-1,-1, 0,     1215,     -3958},
+            { 0, 0, 2, 2,    -1110,         0},
+            { 3, 0,-1, 0,     -892,      3258},
+            { 2, 1, 1, 0,     -810,      2616},
+            { 4,-1,-2, 0,      759,     -1897},
+            { 0, 2,-1, 0,     -713,     -2117},
+            { 2, 2,-1, 0,     -700,      2354},
+            { 2, 1,-2, 0,      691,         0},
+            { 2,-1, 0,-2,      596,         0},
+            { 4, 0, 1, 0,      549,     -1423},
+            { 0, 0, 4, 0,      537,     -1117},
+            { 4,-1, 0, 0,      520,     -1571},
+            { 1, 0,-2, 0,     -487,     -1739},
+            { 2, 1, 0,-2,     -399,         0},
+            { 0, 0, 2,-2,     -381,     -4421},
+            { 1, 1, 1, 0,      351,         0},
+            { 3, 0,-2, 0,     -340,         0},
+            { 4, 0,-3, 0,      330,         0},
+            { 2,-1, 2, 0,      327,         0},
+            { 0, 2, 1, 0,     -323,      1165},
+            { 1, 1,-1, 0,      299,         0},
+            { 2, 0, 3, 0,      294,         0},
+            { 2, 0,-1,-2,        0,      8752},
+          };
+
+          struct BTerm { int8_t D, M, Mp, F; int32_t b; };
+          static const BTerm tblB[60] = {
+            { 0, 0, 0, 1,  5128122},
+            { 0, 0, 1, 1,   280602},
+            { 0, 0, 1,-1,   277693},
+            { 2, 0, 0,-1,   173237},
+            { 2, 0,-1, 1,    55413},
+            { 2, 0,-1,-1,    46271},
+            { 2, 0, 0, 1,    32573},
+            { 0, 0, 2, 1,    17198},
+            { 2, 0, 1,-1,     9266},
+            { 0, 0, 2,-1,     8822},
+            { 2,-1, 0,-1,     8216},
+            { 2, 0,-2,-1,     4324},
+            { 2, 0, 1, 1,     4200},
+            { 2, 1, 0,-1,    -3359},
+            { 2,-1,-1, 1,     2463},
+            { 2,-1, 0, 1,     2211},
+            { 2,-1,-1,-1,     2065},
+            { 0, 1,-1,-1,    -1870},
+            { 4, 0,-1,-1,     1828},
+            { 0, 1, 0, 1,    -1794},
+            { 0, 0, 0, 3,    -1749},
+            { 0, 1,-1, 1,    -1565},
+            { 1, 0, 0, 1,    -1491},
+            { 0, 1, 1, 1,    -1475},
+            { 0, 1, 1,-1,    -1410},
+            { 0, 1, 0,-1,    -1344},
+            { 1, 0, 0,-1,    -1335},
+            { 0, 0, 3, 1,     1107},
+            { 4, 0, 0,-1,     1021},
+            { 4, 0,-1, 1,      833},
+            { 0, 0, 1,-3,      777},
+            { 4, 0,-2, 1,      671},
+            { 2, 0, 0,-3,      607},
+            { 2, 0, 2,-1,      596},
+            { 2,-1, 1,-1,      491},
+            { 2, 0,-2, 1,     -451},
+            { 0, 0, 3,-1,      439},
+            { 2, 0, 2, 1,      422},
+            { 2, 0,-3,-1,      421},
+            { 2, 1,-1, 1,     -366},
+            { 2, 1, 0, 1,     -351},
+            { 4, 0, 0, 1,      331},
+            { 2,-1, 1, 1,      315},
+            { 2,-2, 0,-1,      302},
+            { 0, 0, 1, 3,     -283},
+            { 2, 1, 1,-1,     -229},
+            { 1, 1, 0,-1,      223},
+            { 1, 1, 0, 1,      223},
+            { 0, 1,-2,-1,     -220},
+            { 2, 1,-1,-1,     -220},
+            { 1, 0, 1, 1,     -185},
+            { 2,-1,-2,-1,      181},
+            { 0, 1, 2, 1,     -177},
+            { 4, 0,-2,-1,      176},
+            { 4,-1,-1,-1,      166},
+            { 1, 0, 1,-1,     -164},
+            { 4, 0, 1,-1,      132},
+            { 1, 0,-1,-1,     -119},
+            { 4,-1, 0,-1,      115},
+            { 2,-2, 0, 1,      107},
+          };
+
+          double jde_now = jd_now_ut + dt_days;
+          double Tm  = (jde_now - 2451545.0) / 36525.0;
+          double Tm2 = Tm*Tm, Tm3 = Tm2*Tm, Tm4 = Tm3*Tm;
+
+          auto norm_deg = [](double a) -> double {
+            a = fmod(a, 360.0);
+            if (a < 0) a += 360.0;
+            return a;
+          };
+
+          double Lp  = norm_deg(218.3164477 + 481267.88123421*Tm - 0.0015786*Tm2 + Tm3/538841.0 - Tm4/65194000.0);
+          double Dm  = norm_deg(297.8501921 + 445267.1114034*Tm - 0.0018819*Tm2 + Tm3/545868.0 - Tm4/113065000.0);
+          double Mm  = norm_deg(357.5291092 + 35999.0502909*Tm - 0.0001536*Tm2 + Tm3/24490000.0);
+          double Mpm = norm_deg(134.9633964 + 477198.8675055*Tm + 0.0087414*Tm2 + Tm3/69699.0 - Tm4/14712000.0);
+          double Fm  = norm_deg(93.2720950 + 483202.0175233*Tm - 0.0036539*Tm2 - Tm3/3526000.0 + Tm4/863310000.0);
+
+          double A1m = norm_deg(119.75 + 131.849    * Tm);
+          double A2m = norm_deg( 53.09 + 479264.290 * Tm);
+          double A3m = norm_deg(313.45 + 481266.484 * Tm);
+
+          double Em  = 1.0 - 0.002516 * Tm - 0.0000074 * Tm2;
+          double Em2 = Em * Em;
+
+          double Dm_r  = Dm  * DEG;
+          double Mm_r  = Mm  * DEG;
+          double Mpm_r = Mpm * DEG;
+          double Fm_r  = Fm  * DEG;
+          double Lp_r  = Lp  * DEG;
+
+          double sigL = 0.0, sigR = 0.0, sigB = 0.0;
+
+          for (int i = 0; i < 60; i++) {
+            const LRTerm &t = tblA[i];
+            double arg = t.D*Dm_r + t.M*Mm_r + t.Mp*Mpm_r + t.F*Fm_r;
+            double ef = 1.0;
+            int aM = (t.M < 0) ? -t.M : t.M;
+            if (aM == 1) ef = Em;
+            else if (aM == 2) ef = Em2;
+            sigL += (double)t.l * ef * sin(arg);
+            sigR += (double)t.r * ef * cos(arg);
+          }
+
+          for (int i = 0; i < 60; i++) {
+            const BTerm &t = tblB[i];
+            double arg = t.D*Dm_r + t.M*Mm_r + t.Mp*Mpm_r + t.F*Fm_r;
+            double ef = 1.0;
+            int aM = (t.M < 0) ? -t.M : t.M;
+            if (aM == 1) ef = Em;
+            else if (aM == 2) ef = Em2;
+            sigB += (double)t.b * ef * sin(arg);
+          }
+
+          sigL +=  3958.0 * sin(A1m * DEG)
+                 + 1962.0 * sin(Lp_r - Fm_r)
+                 +  318.0 * sin(A2m * DEG);
+
+          sigB += -2235.0 * sin(Lp_r)
+                 +  382.0 * sin(A3m * DEG)
+                 +  175.0 * sin((A1m - Fm) * DEG)
+                 +  175.0 * sin((A1m + Fm) * DEG)
+                 +  127.0 * sin(Lp_r - Mpm_r)
+                 -  115.0 * sin(Lp_r + Mpm_r);
+
+          double lambda_moon = Lp + sigL / 1000000.0;
+          double beta_moon   = sigB / 1000000.0;
+          double dist_moon   = 385000.56 + sigR / 1000.0;
+          double dist_moon_mi = dist_moon * 0.621371192;
+
+          // ==========================================================
+          // Sun position
+          // ==========================================================
+          double L0s = norm_deg(280.46646 + 36000.76983*Tm + 0.0003032*Tm2);
+          double Ms  = norm_deg(357.52911 + 35999.05029*Tm - 0.0001537*Tm2);
+          double es  = 0.016708634 - 0.000042037*Tm - 0.0000001267*Tm2;
+          double Ms_r = Ms * DEG;
+
+          double C =  (1.914602 - 0.004817*Tm - 0.000014*Tm2) * sin(Ms_r)
+                    + (0.019993 - 0.000101*Tm) * sin(2*Ms_r)
+                    +  0.000289 * sin(3*Ms_r);
+
+          double lambda_sun = norm_deg(L0s + C);
+          double nu_sun     = Ms + C;
+
+          double R_sun_au   = (1.000001018 * (1.0 - es*es)) / (1.0 + es * cos(nu_sun * DEG));
+          double R_sun_km   = R_sun_au * AU_KM;
+
+          // ==========================================================
+          // Illumination and geometric phase angle
+          // ==========================================================
+          double dlon   = (lambda_moon - lambda_sun) * DEG;
+          double beta_r = beta_moon * DEG;
+
+          double cos_psi = cos(beta_r) * cos(dlon);
+          if (cos_psi >  1.0) cos_psi =  1.0;
+          if (cos_psi < -1.0) cos_psi = -1.0;
+
+          double psi = acos(cos_psi);
+          double i_rad = atan2(R_sun_km * sin(psi), dist_moon - R_sun_km * cos(psi));
+
+          double phase_angle_geom = i_rad / DEG;
+          double illumination = (1.0 + cos(i_rad)) * 50.0;
+
+          // ==========================================================
+          // Local moon visibility geometry (topocentric + refraction)
+          // ==========================================================
+          // Observer coordinates. Latitude north is positive.
+          // Longitude east is positive, west is negative.
+          const double OBS_LAT = ${observer_latitude};
+          const double OBS_LON = ${observer_longitude};
+          const double OBS_ELEV_M = ${observer_elevation_m};
+
+          // Mean obliquity of the ecliptic, in radians.
+          // Needed for ecliptic (lambda, beta) -> equatorial (RA, Dec).
+          double eps_deg = 23.4392911111
+                         - 0.0130041667 * Tm
+                         - 0.0000001639 * Tm2
+                         + 0.0000005036 * Tm3;
+          double eps = eps_deg * DEG;
+
+          // --- Safer ecliptic (lambda, beta) -> equatorial (alpha, delta) ---
+          // Uses the stable form without tan(beta).
+          double lam_m = norm_deg(lambda_moon) * DEG;
+          double bet_m = beta_moon * DEG;
+          double cos_bet_m = cos(bet_m);
+          double sin_bet_m = sin(bet_m);
+          double sin_lam_m = sin(lam_m);
+          double cos_lam_m = cos(lam_m);
+
+          double alpha_m = atan2(
+              cos_bet_m * sin_lam_m * cos(eps) - sin_bet_m * sin(eps),
+              cos_bet_m * cos_lam_m
+          );
+
+          double delta_m = asin(
+              sin_bet_m * cos(eps) + cos_bet_m * sin(eps) * sin_lam_m
+          );
+
+          if (alpha_m < 0) alpha_m += 2.0 * PI_D;
+
+          // Sun ecliptic coordinates to equatorial (beta = 0).
+          double lam_s = norm_deg(lambda_sun) * DEG;
+
+          double alpha_s = atan2(
+              sin(lam_s) * cos(eps),
+              cos(lam_s)
+          );
+
+          double delta_s = asin(
+              sin(eps) * sin(lam_s)
+          );
+
+          if (alpha_s < 0) alpha_s += 2.0 * PI_D;
+
+          // Greenwich Mean Sidereal Time, then Local Sidereal Time.
+          double Tu = (jd_now_ut - 2451545.0) / 36525.0;
+
+          double gmst = norm_deg(
+            280.46061837 +
+            360.98564736629 * (jd_now_ut - 2451545.0) +
+            0.000387933 * Tu * Tu -
+            (Tu * Tu * Tu) / 38710000.0
+          );
+
+          double lst = norm_deg(gmst + OBS_LON) * DEG;
+          double lat = OBS_LAT * DEG;
+
+          auto normalize_radians = [&](double a) -> double {
+            while (a < -PI_D) a += 2.0 * PI_D;
+            while (a >  PI_D) a -= 2.0 * PI_D;
+            return a;
+          };
+
+          auto altitude_from_ra_dec = [&](double ra, double dec) -> double {
+            double H = normalize_radians(lst - ra);
+
+            double sin_alt =
+              sin(lat) * sin(dec) +
+              cos(lat) * cos(dec) * cos(H);
+
+            if (sin_alt >  1.0) sin_alt =  1.0;
+            if (sin_alt < -1.0) sin_alt = -1.0;
+
+            return asin(sin_alt) / DEG;
+          };
+
+          auto azimuth_from_ra_dec = [&](double ra, double dec) -> double {
+            double H = normalize_radians(lst - ra);
+
+            double az = atan2(
+              sin(H),
+              cos(H) * sin(lat) - tan(dec) * cos(lat)
+            ) / DEG + 180.0;
+
+            return norm_deg(az);
+          };
+
+          // --- Geocentric altitude, used only as an intermediate/reference ---
+          double moon_alt_geo = altitude_from_ra_dec(alpha_m, delta_m);
+          double sun_altitude_deg = altitude_from_ra_dec(alpha_s, delta_s);
+          double moon_sun_separation_deg = psi / DEG;
+
+          // --- Topocentric parallax correction for the Moon ---
+          // This converts geocentric RA/Dec to observer-centered RA/Dec.
+          // It also uses observer elevation, which is small but easy to include.
+          const double EARTH_EQUATORIAL_RADIUS_KM = 6378.137;
+          const double EARTH_EQUATORIAL_RADIUS_M  = 6378137.0;
+          const double EARTH_FLATTENING_FACTOR    = 0.99664719;
+          const double MOON_RADIUS_KM             = 1737.4;
+
+          double u = atan(EARTH_FLATTENING_FACTOR * tan(lat));
+          double rho_sin_phi =
+            EARTH_FLATTENING_FACTOR * sin(u) +
+            (OBS_ELEV_M / EARTH_EQUATORIAL_RADIUS_M) * sin(lat);
+
+          double rho_cos_phi =
+            cos(u) +
+            (OBS_ELEV_M / EARTH_EQUATORIAL_RADIUS_M) * cos(lat);
+
+          double horizontal_parallax = asin(EARTH_EQUATORIAL_RADIUS_KM / dist_moon);
+          double H_m = normalize_radians(lst - alpha_m);
+
+          double delta_alpha = atan2(
+            -rho_cos_phi * sin(horizontal_parallax) * sin(H_m),
+             cos(delta_m) - rho_cos_phi * sin(horizontal_parallax) * cos(H_m)
+          );
+
+          double alpha_m_topo = alpha_m + delta_alpha;
+          if (alpha_m_topo < 0) alpha_m_topo += 2.0 * PI_D;
+          if (alpha_m_topo >= 2.0 * PI_D) alpha_m_topo -= 2.0 * PI_D;
+
+          double delta_m_topo = atan2(
+            (sin(delta_m) - rho_sin_phi * sin(horizontal_parallax)) * cos(delta_alpha),
+             cos(delta_m) - rho_cos_phi * sin(horizontal_parallax) * cos(H_m)
+          );
+
+          double moon_alt_topo = altitude_from_ra_dec(alpha_m_topo, delta_m_topo);
+          double moon_azimuth_deg = azimuth_from_ra_dec(alpha_m_topo, delta_m_topo);
+
+          // --- Atmospheric refraction, Sæmundsson/Bennett-style approximation ---
+          // Adds standard-atmosphere refraction to the true topocentric altitude.
+          // This makes the displayed altitude match what an observer sees near the horizon.
+          auto refraction_saemundsson_deg = [&](double alt_deg) -> double {
+            double h = alt_deg;
+            if (h < -1.0) h = -1.0;   // valid/safe low-altitude clamp
+            if (h > 89.9) return 0.0;
+
+            double r = 1.02 / tan((h + 10.3 / (h + 5.11)) * DEG);
+            if (r < 0.0) r = 0.0;
+            return r / 60.0;          // arcminutes to degrees
+          };
+
+          double refraction = refraction_saemundsson_deg(moon_alt_topo);
+          double moon_altitude_deg = moon_alt_topo + refraction;   // final apparent center altitude
+
+          // Use the Moon's current apparent semidiameter for horizon state.
+          // If the Moon's upper limb is above the apparent horizon, count it as above.
+          double moon_semidiameter_deg = asin(MOON_RADIUS_KM / dist_moon) / DEG;
+          bool moon_above_horizon_state = moon_altitude_deg > -moon_semidiameter_deg;
+
+          bool moon_visible_clear_sky_state = false;
+
+          if (moon_altitude_deg > 5.0 &&
+              illumination > 0.5 &&
+              moon_sun_separation_deg > 12.0) {
+
+            // Night or dark twilight: if the Moon is up, it should be visible.
+            if (sun_altitude_deg <= -6.0) {
+              moon_visible_clear_sky_state = true;
+            }
+
+            // Daytime/twilight Moon: needs to be higher, brighter, and farther
+            // from the Sun to be realistically visible.
+            else if (moon_altitude_deg > 15.0 &&
+                     illumination > 10.0 &&
+                     moon_sun_separation_deg > 40.0) {
+              moon_visible_clear_sky_state = true;
+            }
+          }
+
+          const char *visibility_status;
+
+          if (moon_visible_clear_sky_state) {
+            visibility_status = "visible_clear_sky";
+          } else if (!moon_above_horizon_state) {
+            visibility_status = "below_horizon";
+          } else if (moon_sun_separation_deg <= 12.0) {
+            visibility_status = "too_close_to_sun";
+          } else if (sun_altitude_deg > -6.0 && illumination <= 10.0) {
+            visibility_status = "too_faint_in_daylight";
+          } else if (moon_altitude_deg <= 5.0) {
+            visibility_status = "too_low_near_horizon";
+          } else {
+            visibility_status = "probably_not_visible";
+          }
+
+          // ==========================================================
+          // Derived values
+          // ==========================================================
+          double lunation_length = next_new - last_new;
+          double age = jd_now_ut - last_new;
+          double days_to_full = next_full - jd_now_ut;
+          double seconds_to_full = days_to_full * 86400.0;
+          double cycle_angle = (age / lunation_length) * 360.0;
+
+          double lon_diff = lambda_moon - lambda_sun;
+          while (lon_diff < 0)    lon_diff += 360.0;
+          while (lon_diff >= 360) lon_diff -= 360.0;
+
+          const char *phase_name;
+
+          const char *event_names[4] = {
+            "new_moon",
+            "first_quarter",
+            "full_moon",
+            "last_quarter"
+          };
+
+          double closest_event_dist = 1e9;
+          int closest_event_type = -1;
+
+          for (int i = 0; i < 24; i++) {
+            double d = fabs(evt_jd_ut[i] - jd_now_ut);
+            if (d < closest_event_dist) {
+              closest_event_dist = d;
+              closest_event_type = evt_type[i];
+            }
+          }
+
+          const double EVENT_WINDOW = 0.75;
+
+          if (closest_event_type >= 0 && closest_event_dist <= EVENT_WINDOW) {
+            phase_name = event_names[closest_event_type];
+          } else if (lon_diff < 90.0) {
+            phase_name = "waxing_crescent";
+          } else if (lon_diff < 180.0) {
+            phase_name = "waxing_gibbous";
+          } else if (lon_diff < 270.0) {
+            phase_name = "waning_gibbous";
+          } else {
+            phase_name = "waning_crescent";
+          }
+
+          bool is_full = false;
+          if (have_next_full && fabs(next_full - jd_now_ut) < 18.0/24.0) is_full = true;
+          if (have_last_full && fabs(jd_now_ut - last_full) < 18.0/24.0) is_full = true;
+
+          double Tf = next_full_k / 1236.85;
+          double F_at_full = 160.7108 + 390.67050284 * next_full_k
+                             - 0.0016118  * Tf*Tf
+                             - 0.00000227 * Tf*Tf*Tf
+                             + 0.000000011* Tf*Tf*Tf*Tf;
+
+          double Fred = fmod(F_at_full, 360.0);
+          if (Fred > 180.0)  Fred -= 360.0;
+          if (Fred < -180.0) Fred += 360.0;
+
+          double Fnode = fabs(Fred);
+          if (Fnode > 90.0) Fnode = 180.0 - Fnode;
+
+          bool eclipse_possible = (Fnode < 12.0);
+
+          auto jd_to_unix = [&](double jd) -> double {
+            return (jd - JD_UNIX_EPOCH) * 86400.0;
+          };
+
+          auto format_iso = [](double ts) -> std::string {
+            time_t t = (time_t) llround(ts);
+            struct tm tm_utc;
+            gmtime_r(&t, &tm_utc);
+            char buf[32];
+
+            snprintf(buf, sizeof(buf),
+                     "%04d-%02d-%02dT%02d:%02d:%02d+00:00",
+                     tm_utc.tm_year + 1900,
+                     tm_utc.tm_mon + 1,
+                     tm_utc.tm_mday,
+                     tm_utc.tm_hour,
+                     tm_utc.tm_min,
+                     tm_utc.tm_sec);
+
+            return std::string(buf);
+          };
+
+          id(moon_altitude).publish_state(moon_altitude_deg);
+          id(moon_azimuth).publish_state(moon_azimuth_deg);
+          id(sun_altitude).publish_state(sun_altitude_deg);
+          id(moon_sun_separation).publish_state(moon_sun_separation_deg);
+          id(moon_above_horizon).publish_state(moon_above_horizon_state);
+          id(moon_visible_clear_sky).publish_state(moon_visible_clear_sky_state);
+          id(moon_visibility_status).publish_state(visibility_status);
+          id(moon_visible_clear_sky_text).publish_state(
+            moon_visible_clear_sky_state ? "Visible" : "Hidden"
+          );
+          id(moon_is_full_text).publish_state(
+            is_full ? "Full" : "Not full"
+          );
+          id(moon_above_horizon_text).publish_state(
+            moon_above_horizon_state ? "Above" : "Below"
+          );
+
+          id(moon_phase_angle).publish_state(cycle_angle);
+          id(moon_illumination).publish_state(illumination);
+          id(moon_days_until_full).publish_state(days_to_full);
+          id(moon_phase_name).publish_state(phase_name);
+          id(moon_is_full).publish_state(is_full);
+
+          id(moon_phase_angle_geom).publish_state(phase_angle_geom);
+          id(moon_distance_km).publish_state(dist_moon);
+          id(moon_distance_mi).publish_state(dist_moon_mi);
+          id(moon_seconds_until_full).publish_state(seconds_to_full);
+          id(current_lunation_length).publish_state(lunation_length);
+
+          id(last_new_moon).publish_state(format_iso(jd_to_unix(last_new)));
+          id(next_new_moon).publish_state(format_iso(jd_to_unix(next_new)));
+          id(next_first_quarter).publish_state(format_iso(jd_to_unix(next_q1)));
+          id(next_full_moon).publish_state(format_iso(jd_to_unix(next_full)));
+          id(next_last_quarter).publish_state(format_iso(jd_to_unix(next_q3)));
+
+          id(eclipse_at_next_full).publish_state(eclipse_possible);
+
+sensor:
+  - platform: uptime
+    type: seconds
+    name: "Uptime"
+    id: node_uptime_seconds
+    icon: mdi:clock-outline
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Moon Phase Angle"
+    id: moon_phase_angle
+    icon: mdi:moon-waxing-crescent
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Moon Illumination"
+    id: moon_illumination
+    icon: mdi:brightness-percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Moon Days Until Full"
+    id: moon_days_until_full
+    icon: mdi:moon-full
+    unit_of_measurement: "d"
+    device_class: duration
+    accuracy_decimals: 4
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Moon Phase Angle Geometric"
+    id: moon_phase_angle_geom
+    icon: mdi:angle-acute
+    unit_of_measurement: "°"
+    accuracy_decimals: 3
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Moon Altitude"
+    id: moon_altitude
+    icon: mdi:angle-acute
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Moon Azimuth"
+    id: moon_azimuth
+    icon: mdi:compass-outline
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Sun Altitude"
+    id: sun_altitude
+    icon: mdi:white-balance-sunny
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Moon Sun Separation"
+    id: moon_sun_separation
+    icon: mdi:angle-acute
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Moon Distance"
+    id: moon_distance_km
+    icon: mdi:ruler
+    unit_of_measurement: "km"
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Moon Distance Miles"
+    id: moon_distance_mi
+    icon: mdi:ruler
+    unit_of_measurement: "mi"
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Current Lunation Length"
+    id: current_lunation_length
+    icon: mdi:calendar-clock
+    unit_of_measurement: "d"
+    device_class: duration
+    accuracy_decimals: 6
+    state_class: measurement
+    update_interval: never
+
+  - platform: template
+    name: "Moon Seconds Until Full"
+    id: moon_seconds_until_full
+    icon: mdi:timer-outline
+    unit_of_measurement: "s"
+    device_class: duration
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+
+binary_sensor:
+  - platform: status
+    name: "Node Status"
+    id: node_status
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Moon Is Full"
+    id: moon_is_full
+    icon: mdi:moon-full
+
+  - platform: template
+    name: "Moon Above Horizon"
+    id: moon_above_horizon
+    icon: mdi:moon-waxing-crescent
+
+  - platform: template
+    name: "Moon Visible Clear Sky"
+    id: moon_visible_clear_sky
+    icon: mdi:moon-waning-gibbous
+
+  - platform: template
+    name: "Eclipse Possible at Next Full"
+    id: eclipse_at_next_full
+    icon: mdi:weather-night
+
+text_sensor:
+  - platform: version
+    name: "ESPHome Version"
+    id: esphome_version
+    icon: mdi:chip
+    hide_timestamp: true
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Moon Phase"
+    id: moon_phase_name
+    icon: mdi:moon-waxing-crescent
+    update_interval: never
+
+  - platform: template
+    name: "Moon Visibility Reason"
+    id: moon_visibility_status
+    icon: mdi:eye-outline
+    update_interval: never
+
+  - platform: template
+    name: "Moon View"
+    id: moon_visible_clear_sky_text
+    icon: mdi:eye-outline
+    update_interval: never
+
+  - platform: template
+    name: "Full Moon Status"
+    id: moon_is_full_text
+    icon: mdi:moon-full
+    update_interval: never
+
+  - platform: template
+    name: "Moon Horizon"
+    id: moon_above_horizon_text
+    icon: mdi:moon-waxing-crescent
+    update_interval: never
+
+  - platform: template
+    name: "Last New Moon"
+    id: last_new_moon
+    icon: mdi:moon-new
+    device_class: timestamp
+    update_interval: never
+
+  - platform: template
+    name: "Next New Moon"
+    id: next_new_moon
+    icon: mdi:moon-new
+    device_class: timestamp
+    update_interval: never
+
+  - platform: template
+    name: "Next First Quarter"
+    id: next_first_quarter
+    icon: mdi:moon-first-quarter
+    device_class: timestamp
+    update_interval: never
+
+  - platform: template
+    name: "Next Full Moon"
+    id: next_full_moon
+    icon: mdi:moon-full
+    device_class: timestamp
+    update_interval: never
+
+  - platform: template
+    name: "Next Last Quarter"
+    id: next_last_quarter
+    icon: mdi:moon-last-quarter
+    device_class: timestamp
+    update_interval: never
+
+button:
+  - platform: safe_mode
+    name: "Restart in Safe Mode"
+    icon: mdi:lifebuoy
