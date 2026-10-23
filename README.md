@@ -1,141 +1,57 @@
 # Moon Box Node
 
-Moon Box Node is an ESPHome based Moon calculation project for Home Assistant and a real time DIY Moon Box display.
+An ESPHome project that calculates Moon data locally on an ESP32 and publishes it to Home Assistant. The goal is a physical Moon Box with a round phase display and a second view showing the Moon's position and upcoming events.
 
-The goal is to calculate useful Moon data locally on an ESP32 and send that data into Home Assistant. This data can then be used for a physical Moon display, dashboard cards, automations, and future display hardware.
+**Work in progress:** calculation/entity code is available; physical displays and complete astronomical accuracy validation remain unfinished. No display driver, weather feed or finished enclosure is included.
 
-## Project Goal
+## Current features
 
-I am building a physical Moon Box that can show the Moon in a more accurate and useful way than a simple phase icon.
+- Phase name, illumination, cycle angle and geometric phase angle.
+- Apparent topocentric Moon altitude, azimuth, distance, Sun altitude and Moon/Sun separation.
+- Last/next new moon, next first quarter, full moon and last quarter, and current lunation length.
+- **Next moonrise and next moonset**, using the newer local implementation now included in the public template.
+- Above-horizon state, clear-sky visibility estimate, full-moon status and rough possible-eclipse flag.
+- Home Assistant entities, uptime, version, status and safe-mode restart button.
 
-The project is meant to calculate and display real Moon data such as phase, illumination, altitude, azimuth, horizon status, and upcoming lunar events. Eventually, this data will be used with one or more displays to show the Moon moving across the sky and changing phase over time.
+SNTP time is preferred, with Home Assistant time as fallback. Without a valid clock the script returns without publishing new calculations. Updates run on time synchronization and every 15 minutes. Local computation can continue while HA is unreachable after a usable clock is established; networking is still needed to acquire/synchronize time.
 
-## Main Features
+See [calculation behavior and limits](docs/CALCULATIONS.md). “Visible Clear Sky” is a geometry/brightness heuristic; it does not measure clouds. The eclipse flag is not a prediction of an observable eclipse.
 
-* Moon phase name
-* Moon illumination percentage
-* Moon altitude
-* Moon azimuth
-* Sun altitude
-* Moon and Sun angular separation
-* Moon distance in kilometers and miles
-* Last new moon
-* Next new moon
-* Next first quarter
-* Next full moon
-* Next last quarter
-* Current lunation length
-* Moon above horizon status
-* Moon visible in clear sky status
-* Eclipse possible at next full moon estimate
-* WiFi signal and diagnostic entities
-* Home Assistant integration through ESPHome
+## Set up a Wi-Fi build
 
-* ## Before Flashing
+1. Keep `moon_node.yaml` and `moon_node_wifi.example.yaml` together. Copy the example to **`moon_node_wifi.local.yaml`**; this private filename is ignored by Git.
+2. Copy `secrets.example.yaml` to **`secrets.yaml`** in the same directory. Replace every placeholder with your own credentials and observer latitude, longitude and elevation. North/east are positive; west/south are negative. The public base's `0,0` values are placeholders.
+3. Generate a unique API key using the [ESPHome API key generator](https://esphome.io/components/api/) or `openssl rand -base64 32`. Supply your own OTA password and network credentials in the private secrets file.
+4. Review the **hardware requirements below**. The base retains the original node's board-specific advanced settings.
+5. Validate and compile your private wrapper:
 
-This YAML is a public template.
+   ```bash
+   esphome config moon_node_wifi.local.yaml
+   esphome compile moon_node_wifi.local.yaml
+   ```
 
-Before flashing it to your own ESP32, you must add your own network configuration and location values.
+6. Use your board's normal ESPHome installation process. Before OTA to an existing device, confirm chip revision and bootloader compatibility. Add the device in Home Assistant using your API key, then check fresh values.
 
-The public version does not include WiFi credentials, private location coordinates, or personal light/output functions.
+`moon_node.yaml` is the calculation base package. It intentionally has no network transport and is not the standalone file to validate/flash unchanged. The Wi-Fi wrapper supplies networking and location substitutions through [ESPHome packages](https://esphome.io/components/packages/). An Ethernet build can supply its own wrapper.
 
-You need to add your own:
+## Hardware requirements
 
-- WiFi or Ethernet configuration
-- Latitude
-- Longitude
-- Elevation in meters
-- API encryption key if desired
-- OTA settings if desired
-- Any light, LED, display, or button functions for your own hardware
+The original target is `esp32dev`, original ESP32, ESP-IDF. Its retained configuration requires **chip revision 3.1 or newer** and enables **`sram1_as_iram`**, which requires a compatible bootloader. These settings were specific to the original node. Check the [official ESP32 configuration documentation](https://esphome.io/components/esp32/) and your actual board before building. If needed, adjust the advanced block in your local copy and validate for that hardware. Repository checks do not flash a device.
 
-The included Moon calculations are the core of the project. Hardware-specific features should be customized for each build.
+The configured ESPHome minimum is 2026.4.0. The Wi-Fi example was schema-validated and C++ source-generated using **ESPHome 2026.9.1** with synthetic settings; see [validation](docs/VALIDATION.md) for exact scope. This does not establish a completed hardware or accuracy test on every board/version.
 
-## Hardware
+## Home Assistant and displays
 
-This project is currently built around an ESP32 running ESPHome.
+The node publishes sensor, binary-sensor and timestamp text entities through the encrypted ESPHome API. Rise/set and phase-event timestamps are UTC ISO strings; HA may display them in its own timezone. Use the entity IDs created in your installation.
 
-The ESP32 calculates Moon data and publishes it to Home Assistant. The data can then be used by Home Assistant dashboards, automations, and future Moon Box display hardware.
+Rise/set searches 72 hours ahead and caches results between updates. An `unknown` value means no crossing was found within that window, which can occur at high latitudes. Existing phase names and full-moon status use a broad event window rather than an instantaneous transition.
 
-Planned or possible hardware includes:
+Planned work includes round/rectangular display drivers, Moon rendering, weather-aware visibility, broader reference comparisons and hardware timing/memory measurements. See [CHANGELOG.md](CHANGELOG.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
-* ESP32 board
-* ESPHome
-* Home Assistant
-* Round display for the Moon phase view
-* Rectangular display for Moon position and sky data
-* Enclosure for the physical Moon Box
-* Optional buttons, LEDs, or other status indicators
+## Privacy
 
-## Home Assistant
-
-The ESP32 exposes Moon data as Home Assistant entities through ESPHome.
-
-These entities can be used for:
-
-* Dashboards
-* Automations
-* Physical display logic
-* Moon phase lighting effects
-* Visibility status
-* Future local AI or home monitoring projects
-
-## Accuracy Goals
-
-This project is intended to be more accurate than a basic Moon phase sensor.
-
-The current goal is to calculate:
-
-* Local Moon altitude
-* Local Moon azimuth
-* Moon illumination percentage
-* Moon phase events
-* Horizon visibility
-* Clear sky visibility logic
-* Apparent Moon altitude using local observer data
-
-This project is still experimental, and the calculations may continue to improve over time.
-
-## Important Security Note
-
-Do not upload your real ESPHome `secrets.yaml` file to GitHub.
-
-This project uses ESPHome secret references such as:
-
-```yaml
-!secret wifi_ssid
-!secret wifi_password
-!secret moon_node_api_key
-!secret moon_node_ota_password
-```
-
-The real values should stay only in Home Assistant or in your local ESPHome secrets file.
-
-## Project Status
-
-This is an early working project.
-
-The current focus is:
-
-1. Accurate Moon calculations
-2. Reliable ESPHome entities
-3. Home Assistant integration
-4. Preparing the project for a physical Moon Box display
-5. Making the project clear enough for others to understand, use, and improve
-
-## Future Plans
-
-Possible future improvements include:
-
-* Physical round Moon phase display
-* Rectangular Moon sky position display
-* Better visual Moon rendering
-* More accurate visibility logic using weather data
-* Moonrise and moonset display
-* GitHub community improvements
-* Documentation for setup and flashing
-* Example Home Assistant dashboard cards
+Keep `secrets.yaml` and `*.local.yaml` private. Do not upload credentials, precise household coordinates, device identities, logs containing addresses or identifying dashboard screenshots. Only placeholders and public/synthetic test locations belong here.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

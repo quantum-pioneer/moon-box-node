@@ -1,0 +1,40 @@
+{
+  "description": "Limited smoke comparison with U.S. Naval Observatory public-coordinate rise/set samples. This is not general astronomical accuracy validation.",
+  "provider": "U.S. Naval Observatory Astronomical Applications Department",
+  "api_version": "4.0.1",
+  "source_timezone_hours": 0,
+  "source_precision": "minute; :00 seconds below denote the published minute, not second-resolution reference truth",
+  "maximum_absolute_difference_seconds": 120,
+  "samples": [
+    {
+      "id": "dc-20261023",
+      "source_url": "https://aa.usno.navy.mil/api/rstt/oneday?date=2026-10-23&coords=38.9,-77.0&tz=0",
+      "latitude_deg": 38.9,
+      "longitude_deg": -77.0,
+      "elevation_m": 0,
+      "start_utc": "2026-10-23T00:00:00+00:00",
+      "next_moonrise_utc": "2026-10-23T20:48:00+00:00",
+      "next_moonset_utc": "2026-10-23T08:32:00+00:00"
+    },
+    {
+      "id": "dc-20261024",
+      "source_url": "https://aa.usno.navy.mil/api/rstt/oneday?date=2026-10-24&coords=38.9,-77.0&tz=0",
+      "latitude_deg": 38.9,
+      "longitude_deg": -77.0,
+      "elevation_m": 0,
+      "start_utc": "2026-10-24T00:00:00+00:00",
+      "next_moonrise_utc": "2026-10-24T21:13:00+00:00",
+      "next_moonset_utc": "2026-10-24T09:39:00+00:00"
+    },
+    {
+      "id": "equator-20261023",
+      "source_url": "https://aa.usno.navy.mil/api/rstt/oneday?date=2026-10-23&coords=0,0&tz=0",
+      "latitude_deg": 0.0,
+      "longitude_deg": 0.0,
+      "elevation_m": 0,
+      "start_utc": "2026-10-23T00:00:00+00:00",
+      "next_moonrise_utc": "2026-10-23T15:40:00+00:00",
+      "next_moonset_utc": "2026-10-23T03:16:00+00:00"
+    }
+  ]
+}

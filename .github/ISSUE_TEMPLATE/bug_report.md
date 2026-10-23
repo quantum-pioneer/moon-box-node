@@ -1,38 +1,27 @@
 ---
 name: Bug report
-about: Create a report to help us improve
+about: Report a Moon calculation or ESPHome setup problem.
 title: ''
 labels: ''
 assignees: ''
-
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+**Problem and expected behavior**
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+**Version and hardware**
+- Project commit:
+- ESPHome version / framework:
+- Board, chip revision and bootloader:
+- Wi-Fi wrapper or custom Ethernet configuration:
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+**Steps to reproduce**
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+**For calculation differences**
+- UTC input time:
+- Public/synthetic location and elevation (do not share household coordinates):
+- Entity, actual result and units:
+- Reference source/result and timezone/horizon/refraction conventions:
 
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
+**Small redacted error excerpt or measurements**
 
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
-
-**Additional context**
-Add any other context about the problem here.
+Remove credentials, private coordinates, network/device identities and identifying screenshots. State whether this was a host calculation, build check or physical-device test.

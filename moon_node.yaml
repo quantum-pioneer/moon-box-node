@@ -42,7 +42,7 @@ logger:
 
 api:
   encryption:
-    key: "PUT_YOUR_ESPHOME_API_ENCRYPTION_KEY_HERE"
+    key: !secret moon_node_api_key
   # 0s keeps the node computing the Moon locally while HA is unreachable.
   # Trade-off: no self-heal reboot if the network stack wedges.
   # Set to 15min instead if you prefer auto recovery over offline persistence.
@@ -50,7 +50,7 @@ api:
 
 ota:
   - platform: esphome
-    password: "PUT_YOUR_OTA_PASSWORD_HERE"
+    password: !secret moon_node_ota_password
 
 # Safe mode is auto-enabled by the OTA component. Declared explicitly so the
 # recovery button below has a component to attach to.
@@ -729,6 +729,142 @@ script:
           double moon_semidiameter_deg = asin(MOON_RADIUS_KM / dist_moon) / DEG;
           bool moon_above_horizon_state = moon_altitude_deg > -moon_semidiameter_deg;
 
+          // Evaluate the same apparent upper-limb horizon test used above at
+          // any trial UTC Julian date. Positive means the Moon is above the
+          // apparent horizon; negative means it is below.
+          auto moon_horizon_value_at_jd = [&](double jd_ut_eval) -> double {
+            double jde_eval = jd_ut_eval + dt_days;
+            double Te  = (jde_eval - 2451545.0) / 36525.0;
+            double Te2 = Te*Te, Te3 = Te2*Te, Te4 = Te3*Te;
+
+            double Lp_e  = norm_deg(218.3164477 + 481267.88123421*Te - 0.0015786*Te2 + Te3/538841.0 - Te4/65194000.0);
+            double D_e   = norm_deg(297.8501921 + 445267.1114034*Te - 0.0018819*Te2 + Te3/545868.0 - Te4/113065000.0);
+            double M_e   = norm_deg(357.5291092 + 35999.0502909*Te - 0.0001536*Te2 + Te3/24490000.0);
+            double Mp_e  = norm_deg(134.9633964 + 477198.8675055*Te + 0.0087414*Te2 + Te3/69699.0 - Te4/14712000.0);
+            double F_e   = norm_deg(93.2720950 + 483202.0175233*Te - 0.0036539*Te2 - Te3/3526000.0 + Te4/863310000.0);
+
+            double A1_e = norm_deg(119.75 + 131.849    * Te);
+            double A2_e = norm_deg( 53.09 + 479264.290 * Te);
+            double A3_e = norm_deg(313.45 + 481266.484 * Te);
+
+            double E_e  = 1.0 - 0.002516 * Te - 0.0000074 * Te2;
+            double E2_e = E_e * E_e;
+
+            double D_e_r  = D_e  * DEG;
+            double M_e_r  = M_e  * DEG;
+            double Mp_e_r = Mp_e * DEG;
+            double F_e_r  = F_e  * DEG;
+            double Lp_e_r = Lp_e * DEG;
+
+            double sigL_e = 0.0, sigR_e = 0.0, sigB_e = 0.0;
+
+            for (int i = 0; i < 60; i++) {
+              const LRTerm &t = tblA[i];
+              double arg = t.D*D_e_r + t.M*M_e_r + t.Mp*Mp_e_r + t.F*F_e_r;
+              double ef = 1.0;
+              int aM = (t.M < 0) ? -t.M : t.M;
+              if (aM == 1) ef = E_e;
+              else if (aM == 2) ef = E2_e;
+              sigL_e += (double)t.l * ef * sin(arg);
+              sigR_e += (double)t.r * ef * cos(arg);
+            }
+
+            for (int i = 0; i < 60; i++) {
+              const BTerm &t = tblB[i];
+              double arg = t.D*D_e_r + t.M*M_e_r + t.Mp*Mp_e_r + t.F*F_e_r;
+              double ef = 1.0;
+              int aM = (t.M < 0) ? -t.M : t.M;
+              if (aM == 1) ef = E_e;
+              else if (aM == 2) ef = E2_e;
+              sigB_e += (double)t.b * ef * sin(arg);
+            }
+
+            sigL_e +=  3958.0 * sin(A1_e * DEG)
+                      + 1962.0 * sin(Lp_e_r - F_e_r)
+                      +  318.0 * sin(A2_e * DEG);
+
+            sigB_e += -2235.0 * sin(Lp_e_r)
+                      +  382.0 * sin(A3_e * DEG)
+                      +  175.0 * sin((A1_e - F_e) * DEG)
+                      +  175.0 * sin((A1_e + F_e) * DEG)
+                      +  127.0 * sin(Lp_e_r - Mp_e_r)
+                      -  115.0 * sin(Lp_e_r + Mp_e_r);
+
+            double lambda_e = Lp_e + sigL_e / 1000000.0;
+            double beta_e   = sigB_e / 1000000.0;
+            double dist_e   = 385000.56 + sigR_e / 1000.0;
+
+            double eps_e_deg = 23.4392911111
+                             - 0.0130041667 * Te
+                             - 0.0000001639 * Te2
+                             + 0.0000005036 * Te3;
+            double eps_e = eps_e_deg * DEG;
+
+            double lam_e = norm_deg(lambda_e) * DEG;
+            double bet_e = beta_e * DEG;
+            double cos_bet_e = cos(bet_e);
+            double sin_bet_e = sin(bet_e);
+            double sin_lam_e = sin(lam_e);
+            double cos_lam_e = cos(lam_e);
+
+            double alpha_e = atan2(
+                cos_bet_e * sin_lam_e * cos(eps_e) - sin_bet_e * sin(eps_e),
+                cos_bet_e * cos_lam_e
+            );
+
+            double delta_e = asin(
+                sin_bet_e * cos(eps_e) + cos_bet_e * sin(eps_e) * sin_lam_e
+            );
+
+            if (alpha_e < 0) alpha_e += 2.0 * PI_D;
+
+            double Tu_e = (jd_ut_eval - 2451545.0) / 36525.0;
+            double gmst_e = norm_deg(
+              280.46061837 +
+              360.98564736629 * (jd_ut_eval - 2451545.0) +
+              0.000387933 * Tu_e * Tu_e -
+              (Tu_e * Tu_e * Tu_e) / 38710000.0
+            );
+
+            double lst_e = norm_deg(gmst_e + OBS_LON) * DEG;
+
+            auto altitude_from_ra_dec_eval = [&](double ra, double dec) -> double {
+              double H = normalize_radians(lst_e - ra);
+
+              double sin_alt =
+                sin(lat) * sin(dec) +
+                cos(lat) * cos(dec) * cos(H);
+
+              if (sin_alt >  1.0) sin_alt =  1.0;
+              if (sin_alt < -1.0) sin_alt = -1.0;
+
+              return asin(sin_alt) / DEG;
+            };
+
+            double horizontal_parallax_e = asin(EARTH_EQUATORIAL_RADIUS_KM / dist_e);
+            double H_e = normalize_radians(lst_e - alpha_e);
+
+            double delta_alpha_e = atan2(
+              -rho_cos_phi * sin(horizontal_parallax_e) * sin(H_e),
+               cos(delta_e) - rho_cos_phi * sin(horizontal_parallax_e) * cos(H_e)
+            );
+
+            double alpha_topo_e = alpha_e + delta_alpha_e;
+            if (alpha_topo_e < 0) alpha_topo_e += 2.0 * PI_D;
+            if (alpha_topo_e >= 2.0 * PI_D) alpha_topo_e -= 2.0 * PI_D;
+
+            double delta_topo_e = atan2(
+              (sin(delta_e) - rho_sin_phi * sin(horizontal_parallax_e)) * cos(delta_alpha_e),
+               cos(delta_e) - rho_cos_phi * sin(horizontal_parallax_e) * cos(H_e)
+            );
+
+            double alt_topo_e = altitude_from_ra_dec_eval(alpha_topo_e, delta_topo_e);
+            double apparent_alt_e = alt_topo_e + refraction_saemundsson_deg(alt_topo_e);
+            double semidiameter_e = asin(MOON_RADIUS_KM / dist_e) / DEG;
+
+            return apparent_alt_e + semidiameter_e;
+          };
+
           bool moon_visible_clear_sky_state = false;
 
           if (moon_altitude_deg > 5.0 &&
@@ -853,6 +989,101 @@ script:
             return std::string(buf);
           };
 
+          static double cached_rise_set_calc_ts = 0.0;
+          static double cached_next_moonrise_ts = 0.0;
+          static double cached_next_moonset_ts = 0.0;
+          static bool cached_next_moonrise_valid = false;
+          static bool cached_next_moonset_valid = false;
+          static std::string cached_next_moonrise_iso;
+          static std::string cached_next_moonset_iso;
+
+          double now_ts = (double) now.timestamp;
+          const double RISE_SET_CACHE_SECONDS = 15.0 * 60.0;
+
+          bool moonrise_due = cached_next_moonrise_valid && cached_next_moonrise_ts <= now_ts;
+          bool moonset_due = cached_next_moonset_valid && cached_next_moonset_ts <= now_ts;
+          bool rise_set_cache_empty = cached_rise_set_calc_ts <= 0.0;
+          bool rise_set_cache_stale =
+            !rise_set_cache_empty &&
+            ((now_ts - cached_rise_set_calc_ts) >= RISE_SET_CACHE_SECONDS ||
+             now_ts < cached_rise_set_calc_ts - 60.0);
+
+          if (rise_set_cache_empty || rise_set_cache_stale || moonrise_due || moonset_due) {
+            bool found_moonrise = false;
+            bool found_moonset = false;
+            double found_moonrise_jd = 0.0;
+            double found_moonset_jd = 0.0;
+
+            const double SEARCH_DAYS = 3.0;           // 72 hours
+            const double STEP_DAYS = 10.0 / 1440.0;   // 10 minutes
+            double search_start_jd = jd_now_ut;
+            double search_end_jd = jd_now_ut + SEARCH_DAYS;
+            double prev_jd = search_start_jd;
+            double prev_value = moon_horizon_value_at_jd(prev_jd);
+
+            auto refine_crossing_jd = [&](double lo_jd, double hi_jd, bool rising) -> double {
+              for (int i = 0; i < 24; i++) {
+                double mid_jd = (lo_jd + hi_jd) * 0.5;
+                double mid_value = moon_horizon_value_at_jd(mid_jd);
+
+                if (rising) {
+                  if (mid_value > 0.0) hi_jd = mid_jd;
+                  else lo_jd = mid_jd;
+                } else {
+                  if (mid_value > 0.0) lo_jd = mid_jd;
+                  else hi_jd = mid_jd;
+                }
+              }
+
+              return (lo_jd + hi_jd) * 0.5;
+            };
+
+            for (double cur_jd = search_start_jd + STEP_DAYS;
+                 cur_jd <= search_end_jd + 0.0000001;
+                 cur_jd += STEP_DAYS) {
+              if (cur_jd > search_end_jd) cur_jd = search_end_jd;
+
+              double cur_value = moon_horizon_value_at_jd(cur_jd);
+
+              if (!found_moonrise && prev_value <= 0.0 && cur_value > 0.0) {
+                found_moonrise_jd = refine_crossing_jd(prev_jd, cur_jd, true);
+                found_moonrise = true;
+              }
+
+              if (!found_moonset && prev_value >= 0.0 && cur_value < 0.0) {
+                found_moonset_jd = refine_crossing_jd(prev_jd, cur_jd, false);
+                found_moonset = true;
+              }
+
+              if (found_moonrise && found_moonset) break;
+
+              prev_jd = cur_jd;
+              prev_value = cur_value;
+            }
+
+            cached_rise_set_calc_ts = now_ts;
+
+            if (found_moonrise) {
+              cached_next_moonrise_ts = jd_to_unix(found_moonrise_jd);
+              cached_next_moonrise_iso = format_iso(cached_next_moonrise_ts);
+              cached_next_moonrise_valid = true;
+            } else {
+              cached_next_moonrise_ts = 0.0;
+              cached_next_moonrise_iso.clear();
+              cached_next_moonrise_valid = false;
+            }
+
+            if (found_moonset) {
+              cached_next_moonset_ts = jd_to_unix(found_moonset_jd);
+              cached_next_moonset_iso = format_iso(cached_next_moonset_ts);
+              cached_next_moonset_valid = true;
+            } else {
+              cached_next_moonset_ts = 0.0;
+              cached_next_moonset_iso.clear();
+              cached_next_moonset_valid = false;
+            }
+          }
+
           id(moon_altitude).publish_state(moon_altitude_deg);
           id(moon_azimuth).publish_state(moon_azimuth_deg);
           id(sun_altitude).publish_state(sun_altitude_deg);
@@ -887,6 +1118,13 @@ script:
           id(next_first_quarter).publish_state(format_iso(jd_to_unix(next_q1)));
           id(next_full_moon).publish_state(format_iso(jd_to_unix(next_full)));
           id(next_last_quarter).publish_state(format_iso(jd_to_unix(next_q3)));
+
+          id(next_moonrise).publish_state(
+            cached_next_moonrise_valid ? cached_next_moonrise_iso.c_str() : "unknown"
+          );
+          id(next_moonset).publish_state(
+            cached_next_moonset_valid ? cached_next_moonset_iso.c_str() : "unknown"
+          );
 
           id(eclipse_at_next_full).publish_state(eclipse_possible);
 
@@ -1106,6 +1344,18 @@ text_sensor:
     name: "Next Last Quarter"
     id: next_last_quarter
     icon: mdi:moon-last-quarter
+    device_class: timestamp
+    update_interval: never
+
+  - platform: template
+    name: "Next Moonrise"
+    id: next_moonrise
+    device_class: timestamp
+    update_interval: never
+
+  - platform: template
+    name: "Next Moonset"
+    id: next_moonset
     device_class: timestamp
     update_interval: never
 

@@ -1,0 +1,14 @@
+# Copy to moon_node_wifi.local.yaml and configure private secrets.yaml.
+# Includes the original node's board-specific advanced ESP32 settings.
+# Verify chip revision/bootloader before firmware installation.
+packages:
+  moon_calculations: !include moon_node.yaml
+
+substitutions:
+  observer_latitude: !secret observer_latitude
+  observer_longitude: !secret observer_longitude
+  observer_elevation_m: !secret observer_elevation_m
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
